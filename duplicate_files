@@ -1,0 +1,300 @@
+#! /usr/bin/perl -w
+use strict;
+use warnings;
+# Ignore smartmatch warnings
+no if $] >= 5.017011, warnings => 'experimental::smartmatch';
+
+use Time::HiRes qw(time gettimeofday tv_interval);
+use File::Find;
+use File::Path;
+use File::Copy;
+use File::Basename;
+use Digest::MD5;
+
+# Start timer
+my ($s, $usec) = gettimeofday();
+my $t0 = [gettimeofday];
+
+my $LOG;
+my %file_hash;
+my %unique_files;
+my @file_name_used;
+my $commit_write = 0;
+my $music_folder_name = 0;
+my $video_folder_name = 0;
+my $image_folder_name = 0;
+my $doc_folder_name = 0;
+my $music_count_current = 0;
+my $video_count_current = 0;
+my $image_count_current = 0;
+my $doc_count_current = 0;
+my $duplicate_music_count_current = 0;
+my $duplicate_video_count_current = 0;
+my $duplicate_image_count_current = 0;
+my $duplicate_doc_count_current = 0;
+
+# Location of configuration file
+my $config_file = './duplicate_files.conf';
+
+# Dump config to seperate namespace
+if (my $err = &ReadConfig($config_file)) {
+    print(STDERR $err, "\n");
+    exit(1);
+}
+
+# Check for debug mode
+unless ($CFG::CFG{'debug_mode'} == 1) {
+    $commit_write = 1;
+}
+
+# Import sort order (0 = descending, default ascending)
+my $sort_date_ascending = $CFG::CFG{'sort_date_ascending'};
+
+# Verbosity 0 = no messages, 5 = all messages
+my $verbosity = $CFG::CFG{'log'}{'verbose'};
+
+# Working folders
+my $source_path = $CFG::CFG{'source'}{'path'};
+my $target_path = $CFG::CFG{'target'}{'path'};
+
+# Rename target files (eg. 00000001.doc, 00000002.doc, ect.)
+my $rename_target = $CFG::CFG{'target'}{'rename_target'};
+
+# Max files per folder
+my $music_count_cap = $CFG::CFG{'music_count_cap'};
+my $video_count_cap = $CFG::CFG{'video_count_cap'};
+my $image_count_cap = $CFG::CFG{'image_count_cap'};
+my $doc_count_cap = $CFG::CFG{'doc_count_cap'};
+
+# File formats to process
+my @music_formats = $CFG::CFG{'music_formats'};
+my @video_formats = $CFG::CFG{'video_formats'};
+my @image_formats = $CFG::CFG{'image_formats'};
+my @doc_formats = $CFG::CFG{'doc_formats'};
+
+# Set all extensions to lowercase
+for my $i (0 .. $#{$music_formats[0]} ) {
+    $music_formats[0][$i] = lc $music_formats[0][$i];
+}
+for my $i (0 .. $#{$video_formats[0]} ) {
+    $video_formats[0][$i] = lc $video_formats[0][$i];
+}
+for my $i (0 .. $#{$image_formats[0]} ) {
+    $image_formats[0][$i] = lc $image_formats[0][$i];
+}
+for my $i (0 .. $#{$doc_formats[0]} ) {
+    $doc_formats[0][$i] = lc $doc_formats[0][$i];
+}
+
+# Open log file
+if (! open($LOG, ">> $CFG::CFG{'log'}{'file'}")) {
+	print(STDERR "ERROR: Failure opening log file: $!\n");
+	exit(1);
+}
+
+&WriteLog("$0 Start", 3); 
+&WriteLog("Source path = $source_path", 5);
+&WriteLog("Target path = $target_path", 5);
+
+# Parse source path
+if (-d $source_path) { 
+    File::Find::find (\&AddFile, $source_path);
+} else {
+    &WriteLog("$source_path is invalid", 1);
+    die "$source_path is invalid.";
+}
+
+# Parse source files
+if ($sort_date_ascending) {
+    # sort date ascending
+    for my $key ( sort { $file_hash{$a}[1] <=> $file_hash{$b}[1] } keys %file_hash ) {
+        &ParseFile($file_hash{$key}[0]);
+    }
+} else {
+    # sort date descending
+    for my $key ( sort { $file_hash{$b}[1] <=> $file_hash{$a}[1] } keys %file_hash ) {
+        &ParseFile($file_hash{$key}[0]);
+    }
+}
+
+&WriteLog("$0 End", 3);
+close($LOG);
+undef($LOG);
+exit(0);
+
+sub ParseFile {
+    my $file_name = $_[0];
+    my ($file_extension) = $file_name =~ /(\.[^.]+)$/;
+    $file_extension = lc $file_extension;
+    if ($file_extension ~~ \@music_formats) {
+        &CopyFile($file_name, $file_extension, 'music');
+        $music_count_current++;
+    } elsif ($file_extension ~~ \@video_formats) {
+        &CopyFile($file_name, $file_extension, 'video');
+        $video_count_current++;
+    } elsif ($file_extension ~~ \@image_formats) {
+        &CopyFile($file_name, $file_extension, 'image');
+        $image_count_current++;
+    } elsif ($file_extension ~~ \@doc_formats) {
+        &CopyFile($file_name, $file_extension, 'doc');
+        $doc_count_current++;
+    }
+    return;
+}
+
+sub CopyFile {
+    my ($file, $extension, $type) = @_;
+    my $copy_target_file = basename($file);
+    my ($tmp_count, $tmp_name, $copy_target_folder); 
+    if ($type eq 'music') {
+        if ($music_count_current % $music_count_cap == 0) {
+            $music_folder_name++;
+            $duplicate_music_count_current = 0;
+        }
+        $tmp_count = $music_count_current;
+        $tmp_name = $music_folder_name;
+        $copy_target_folder = "$target_path/music/" . sprintf("%03d", $tmp_name);
+    } elsif ($type eq 'video') {
+        if ($video_count_current % $video_count_cap == 0) {
+            $video_folder_name++;
+            $duplicate_video_count_current = 0;
+        }
+        $tmp_count = $video_count_current;
+        $tmp_name = $video_folder_name;
+        $copy_target_folder = "$target_path/videos/" . sprintf("%03d", $tmp_name);
+    } elsif ($type eq 'image') {
+        if ($image_count_current % $image_count_cap == 0) {
+            $image_folder_name++;
+            $duplicate_image_count_current = 0;
+        }
+        $tmp_count = $image_count_current;
+        $tmp_name = $image_folder_name;
+        $copy_target_folder = "$target_path/images/" . sprintf("%03d", $tmp_name);
+    } elsif ($type eq 'doc') {
+        if ($doc_count_current % $doc_count_cap == 0) {
+            $doc_folder_name++;
+            $duplicate_doc_count_current = 0;
+        }
+        $tmp_count = $doc_count_current;
+        $tmp_name = $doc_folder_name;
+        $copy_target_folder = "$target_path/docs/" . sprintf("%03d", $tmp_name);
+    } else {
+        &WriteLog("Unknown file type '$type': $!");
+        die "Unknown file type: $type\n";
+    }
+
+    if ($rename_target) {
+        $copy_target_file = sprintf("%08d", $tmp_count) . "$extension";
+    } else {
+        # Check if the filename has been seen before, append counter
+        if ($copy_target_folder . $copy_target_file ~~ \@file_name_used) {
+            if ($type eq 'music') {
+                $duplicate_music_count_current++;
+                $copy_target_file = $duplicate_music_count_current . "_" . $copy_target_file;
+            } elsif ($type eq 'video') {
+                $duplicate_video_count_current++;
+                $copy_target_file = $duplicate_video_count_current . "_" . $copy_target_file;
+            } elsif ($type eq 'image') {
+                $duplicate_image_count_current++;
+                $copy_target_file = $duplicate_image_count_current . "_" . $copy_target_file;
+            } elsif ($type eq 'doc') {
+                $duplicate_doc_count_current++;
+                $copy_target_file = $duplicate_doc_count_current . "_" . $copy_target_file;
+            }
+        }
+        # Add unique name to array
+        $file_name_used[++$#file_name_used] = $copy_target_folder . $copy_target_file;
+    }
+
+    if ($commit_write == 1) {
+        # Check for target folder or try to make it
+        unless (-d $copy_target_folder) {
+            my $eval_mkpath = eval {
+                mkpath($copy_target_folder) 
+            };
+            unless (-d $copy_target_folder) {
+                &WriteLog("$@: $!");
+                die "$@$!\n"; #SOS!
+            }
+        }
+        # Attempt copy
+        my $eval_copy = eval {
+            copy($file, "$copy_target_folder/$copy_target_file")
+        };
+        unless (-f "$copy_target_folder/$copy_target_file") {
+            &WriteLog("Failed to copy '$copy_target_folder/$copy_target_file': $!");
+            die "Failed to copy '$copy_target_folder/$copy_target_file': $!\n";
+        }
+        &WriteLog("copied '$file' to '$copy_target_folder/$copy_target_file'", 4);
+    } else {
+        # Debug mode, just write to log
+        &WriteLog("[DEBUG] Source: '$file' to Target: '$copy_target_folder/$copy_target_file'", 1);
+    }
+    return;
+}
+
+sub AddFile {
+    if (-f $_) {
+        my $file = $_;
+        my $file_modified_date = ((stat $file)[9]);
+        my $full_path = $File::Find::name;
+        my $MD5 = MD5file(File::Basename::basename($File::Find::name, ""));   
+        unless ($file_hash{$full_path}) {
+            $file_hash{$MD5} = [$full_path, $file_modified_date];
+        }
+    }
+    return;
+}
+
+sub MD5file {
+    # Another option here would be to read the first X bytes of file
+    my ($file) = @_;
+    unless (open FILE, "<", "$file" ) {
+        &WriteLog("Can't open '$file': $!");
+        return -1; 
+    }
+    binmode(FILE);
+    my $chksum = Digest::MD5->new->addfile(*FILE)->hexdigest;
+    close(FILE);
+    return $chksum;
+}
+
+sub WriteLog {
+    my ($line, $verb) = @_;
+    $line ||= "End_of_Line";
+    $verb ||= "3"; 
+    # Suppress messages below verbosity threshold
+    if ($verb <= $verbosity) {
+        if ($line) {
+            my $date = scalar localtime;
+            my $elapsed = tv_interval ($t0, [gettimeofday]);
+            # Sanitize $line
+            $line =~ tr/a-zA-Z0-9\:\.\-\,\;\\\/_\= //dc;
+            if ($LOG) {
+                # Six digits is approximately 278 days in seconds
+                printf $LOG ("[%9.3f] [%s] %s\n", $elapsed, $date, $line);
+            } else {
+                # Print to console if log is closed
+                printf ("[%9.3f] [%s] %s\n", $elapsed, $date, $line);
+            }
+        }
+    }
+    return;
+}
+
+sub ReadConfig {
+    my $file = $_[0];
+    our $err;
+    {
+        package CFG;
+        my $rc = do($file);
+        if ($@) {
+            $::err = "ERROR: Failure compiling '$file' - $@";
+        } elsif (! defined($rc)) {
+            $::err = "ERROR: Failure reading '$file' - $!";
+        } elsif (! $rc) {
+            $::err = "ERROR: Failure processing '$file'";
+        }
+    }
+    return ($err);
+}
